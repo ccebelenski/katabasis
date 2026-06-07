@@ -29,13 +29,12 @@ jobs:
           pip install -r requirements.txt
 
       - name: byte-compile all .py
-        run: python -m compileall -q kata.py bench_data.py plot.py weatherman.py compare.py sysinfo.py prompts/
+        # prompts/code_corpus.py is corpus text, not a module — explicitly excluded
+        run: python -m compileall -q kata.py bench_data.py plot.py weatherman.py compare.py sysinfo.py prompts/build_chat_corpus.py
 
       - name: import smoke check
         run: |
           python -c "import bench_data, plot, sysinfo, compare"
-          python -c "import kata" || echo "kata.py is a script; skipped"
-          python -c "import weatherman" || echo "weatherman.py is a script; skipped"
 
       - name: yaml configs parse
         run: |
