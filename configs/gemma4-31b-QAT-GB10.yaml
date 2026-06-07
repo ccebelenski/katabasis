@@ -1,0 +1,65 @@
+# katabasis config — Gemma 4 31B QAT (UD-Q4_K_XL), GB10 comparison.
+#
+# Third leg of the GB10 scaling tripod:
+#   - Qwen3.6-27B MTP IQ4_NL  → has MTP draft, ~30 t/s c=1, showed c_sat>1
+#   - Gemma 3 27B Q8_0        → no MTP, larger weights, test "marathon card" hypothesis
+#   - Gemma 4 31B QAT UD-Q4   → QAT (quant-aware trained), newer arch, ~31B params
+#
+# QAT-trained Q4 should give cleaner per-token quality than post-hoc Q4 at
+# similar compute cost. Mirrors gemma3-27b-GB10.yaml sweep for apples-to-apples.
+#
+# Source launcher: /mnt/ssd/llm/gemma/gemma4-31B.sh (params reproduced below
+# where they affect throughput; --temp / --top-p / --top-k / --jinja / batch
+# sizes / --cache-ram match the user's production config).
+name: "gemma4-31b QAT UD-Q4_K_XL — third leg of GB10 tripod"
+
+hardware:
+  cuda_visible_devices: "0"
+  rig_label: "DGX GB10"
+
+server:
+  launch: true
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/gemma-4-31B-it-qat-GGUF:UD-Q4_K_XL
+    - --host: 0.0.0.0
+    - --jinja
+    # Launcher uses --batch-size 8192 --ubatch-size 512. Smaller ubatch than
+    # the Qwen/Gemma3 configs (2048) — keep as the user set it; ubatch affects
+    # prefill chunking and the user picked this for a reason.
+    - --batch-size: 8192
+    - --ubatch-size: 512
+    - --no-context-shift
+    - -fa: "on"
+    # Sampling params from the launcher — pinned for reproducibility.
+    # Throughput-neutral but locks decode behavior across runs.
+    - --temp: 1.0
+    - --top-p: 0.95
+    - --top-k: 64
+    # No --spec-type: Gemma 4 doesn't ship MTP. Pure model decode, so the
+    # c_sat>1 question is "does GB10's unified-memory bandwidth leave parallel
+    # decode headroom on any non-MTP model?" If yes → marathon-card framing
+    # generalizes. If no → c_sat>1 was MTP-specific.
+    - --reasoning: "off"  # Gemma 4 doesn't emit <think> blocks
+    # KV quantization at q8 to keep ctx headroom budget reasonable. QAT models
+    # can be more sensitive to KV quant than post-hoc-quantized models; if
+    # output quality degrades noticeably, revisit and try f16 KV with a
+    # smaller ctx ceiling.
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    - --fit: "on"
+    # --parallel, --kv_unified, --ctx-size intentionally omitted — katabasis
+    # injects them from the sweep math (see Qwen/Gemma3 configs for detail).
+
+sweep:
+  context_sizes:  [256, 1024, 4096, 16384]
+  gen_sizes:      [512]
+  prompt_presets: [niah, code]
+  max_concurrency: 16
+
+output:
+  dir: runs
+  live: true
+  stream_tokens: true
+  gpu_monitor: true

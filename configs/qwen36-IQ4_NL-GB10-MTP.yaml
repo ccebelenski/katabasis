@@ -1,0 +1,84 @@
+# katabasis config — Qwen3.6-27B IQ4_NL, single-GPU baseline with full sweep.
+# Exercises: TTFT, multi-preset (niah + code), and concurrency [1, 2, 4].
+# Estimated wall time on RTX 6000 Ada: ~20-30 min (depending on reasoning length).
+name: "qwen3.6-27b iq4_nl MTP"
+
+hardware:
+  cuda_visible_devices: "0"
+  rig_label: "DGX GB10"
+
+server:
+  launch: true
+  # binary: omitted — llama-server is expected on $PATH. Override only if a
+  # specific build is needed (e.g., a sibling machine with a different path).
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/Qwen3.6-27B-MTP-GGUF:IQ4_NL
+    - --host: 0.0.0.0
+    - --jinja
+    - --batch-size: 8192
+    - --ubatch-size: 2048
+    # --parallel intentionally omitted — katabasis auto-bumps to match
+    # max_concurrency. Leaving it manually would just be redundant.
+    - --no-context-shift
+    - -fa: "on"
+    - --spec-type: draft-mtp
+    - --spec-draft-n-max: 3
+    - --reasoning: "on"
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    # --fit off per project policy (see project_design_decisions). With
+    # --fit on, llama-server silently spills weights/KV to CPU if the
+    # config doesn't fit — invalidates the benchmark without warning.
+    # GB10's 120 GB unified pool easily fits the worst-case requested
+    # KV budget here, so fail-loud at startup is fine.
+    - --fit: "off"
+    # --kv_unified and --ctx-size intentionally omitted — katabasis injects
+    # --kv_unified when max_concurrency > 1 and computes --ctx-size from
+    # the sweep math: (max_ctx + max_gen) × max(c) × 1.10 headroom. Setting
+    # them manually risks silent server-side request cancellation when the
+    # math is wrong. If you want a specific size you may set --ctx-size
+    # here; katabasis never reduces a user-set value, only bumps it up.
+
+sweep:
+  # Operator-aligned ctx selection (revised 2026-06-06): nobody runs
+  # production at ctx=256 except accidentally at the start of a fresh
+  # chat. Pick three realistic operating points spanning 8×:
+  #   2048  — short coding prompt with system prompt, single Q&A
+  #   8192  — typical coding session, mid-length chat, modest RAG
+  #   16384 — long coding session, large doc analysis, heavy history
+  # Covers the regime transition (decode-bound → transitional →
+  # prefill-bound) without spending wall time on values no operator hits.
+  context_sizes:  [2048, 8192, 16384]
+  # gen=512 is the headline sustained-decode size. gen=128 is left commented
+  # because niah always EOSes at ~24 tokens and code amortizes setup poorly
+  # at 128 — uncomment if you want the short-output story too.
+  gen_sizes:      [512]
+  # gen_sizes:      [128, 512]
+
+  # Presets: niah | code | chat (or {file: /path/to/seed.txt}).
+  # code uses the full gen budget (no early EOS), niah EOSes short — together
+  # they show the latency-vs-sustained-decode contrast.
+  prompt_presets: [niah, code]
+
+  # Rolling ramp: c climbs 1..max_concurrency, with in-flight capped at c.
+  # Each level fires at target rate = c / T_req(c=1). The ramp stops when
+  # per-req decode drops below 10% of c=1 baseline (useless_per_req floor),
+  # OR max_concurrency is reached. Aggregate peak and per-req <50% knee
+  # are labeled along the way. See project_design_decisions memory for
+  # full rationale.
+  max_concurrency: 16
+
+  # Math: 2 presets × 3 ctx × 1 gen = 6 cells. Each ramps up to ~16 c levels
+  # with 13-30 samples per level (verify shortcut on c≥4). Walltime per cell
+  # scales with c=1 baseline (~T_req × 25 for c=1, ~T_req × 13 each for c≥4).
+  # Per-cell wall is higher than the old sweep (no light-ctx cells to ramp
+  # through quickly) but total cell count is lower — net expected wall time
+  # similar to the old 8-cell config or modestly faster.
+
+output:
+  dir: runs
+  live: true
+  stream_tokens: true
+  gpu_monitor: true

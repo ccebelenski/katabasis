@@ -1,0 +1,44 @@
+# katabasis config — Gemma 3 27B comparison config. Goal: see whether
+# non-MTP models exhibit c_sat > 1 (parallel decode below saturation),
+# vs Qwen3.6-27B's pure c1/c degradation.
+#
+# Uses unsloth/gemma-3-27b-it-GGUF:Q8_0 (matches the launcher in
+# /mnt/ssd/llm/gemma/gemma3-27B.sh). No MTP draft — pure model decode.
+# Two-regime fit in run_ramp_cell will pick up c_sat automatically.
+name: "gemma3-27b q8 — non-MTP scaling comparison"
+
+hardware:
+  cuda_visible_devices: "0"
+  rig_label: "DGX GB10"
+
+server:
+  launch: true
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/gemma-3-27b-it-GGUF:Q8_0
+    - --host: 0.0.0.0
+    - --jinja
+    - --batch-size: 8192
+    - --ubatch-size: 2048
+    - --no-context-shift
+    - -fa: "on"
+    # No --spec-type: Gemma 3 doesn't ship with MTP. This is the comparison
+    # axis: Qwen3.6 has MTP (saturated at c=1, perfect c1/c), Gemma 3 doesn't
+    # (may have parallel decode headroom → c_sat > 1).
+    - --reasoning: "off"  # Gemma 3 doesn't emit <think>
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    - --fit: "on"
+
+sweep:
+  context_sizes:  [256, 1024, 4096, 16384]
+  gen_sizes:      [512]
+  prompt_presets: [niah, code]
+  max_concurrency: 16
+
+output:
+  dir: runs
+  live: true
+  stream_tokens: true
+  gpu_monitor: true

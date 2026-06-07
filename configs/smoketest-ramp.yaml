@@ -1,0 +1,37 @@
+# katabasis config — Chunk A smoke test for the rolling-ramp driver.
+# Tiny matrix (1 preset × 1 ctx × 1 gen) so a single ramp runs.
+# Should ramp c=1, c=2, ... until the knee or max_concurrency.
+# Wall time estimate: 3-8 minutes depending on rig.
+name: "ramp smoke test — qwen3.6-27b iq4_nl"
+
+hardware:
+  cuda_visible_devices: "0"
+  rig_label: "DGX GB10"
+
+server:
+  launch: true
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/Qwen3.6-27B-MTP-GGUF:IQ4_NL
+    - --host: 0.0.0.0
+    - --jinja
+    - --batch-size: 8192
+    - --ubatch-size: 2048
+    - --no-context-shift
+    - -fa: "on"
+    - --spec-type: draft-mtp
+    - --spec-draft-n-max: 3
+    - --reasoning: "on"
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    - --fit: "on"
+
+sweep:
+  context_sizes:  [1024]   # small ctx so T_req is short
+  gen_sizes:      [512]    # need enough decode to amortize MTP setup
+  prompt_presets: [code]   # code never EOSes early — uses full gen budget
+  max_concurrency: 8       # ramp stops earlier on useless-floor knee
+
+output:
+  dir: runs

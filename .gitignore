@@ -1,0 +1,18 @@
+# venv is per-host, never shared. /mnt/ssd is mounted on multiple machines,
+# so use venv-<rig>/ per host: venv-gb10/, venv-ada/, venv-blackwell/.
+venv*/
+__pycache__/
+*.pyc
+
+# Generated results are per-machine (can be committed if comparing)
+data/
+figures/
+runs/
+
+# Staging area for video B-roll
+clips/
+
+# Editor droppings
+*.swp
+*.swo
+*~

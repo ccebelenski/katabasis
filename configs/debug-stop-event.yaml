@@ -1,0 +1,41 @@
+# katabasis config — DIAGNOSTIC ONLY.
+# Reproduces the code @ ctx=16384 raw_timings={} failure with minimum wall time.
+# Runs 1 batch (code, ctx=16384, gen=128, c=1) so we can inspect the captured
+# last-N SSE lines, JSON decode error count, and final-event keys recorded by
+# the _debug_capture field in raw.jsonl.
+#
+# Wall time: ~1 minute (model load + ~25s for the single failing batch).
+# Output: runs/<ts>__<rig>/raw.jsonl — open the failed row's _debug_capture.
+name: "qwen3.6-27b iq4_nl MTP — debug stop event"
+
+hardware:
+  cuda_visible_devices: "0"
+  rig_label: "DGX GB10"
+
+server:
+  launch: true
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/Qwen3.6-27B-MTP-GGUF:IQ4_NL
+    - --host: 0.0.0.0
+    - --jinja
+    - --batch-size: 8192
+    - --ubatch-size: 2048
+    - --no-context-shift
+    - -fa: "on"
+    - --spec-type: draft-mtp
+    - --spec-draft-n-max: 3
+    - --reasoning: "on"
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    - --fit: "on"
+
+sweep:
+  context_sizes:  [16384]
+  gen_sizes:      [128]
+  prompt_presets: [code]
+  max_concurrency: 1   # c=1 only — just exercise the baseline path
+
+output:
+  dir: runs

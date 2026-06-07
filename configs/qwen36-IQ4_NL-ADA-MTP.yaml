@@ -1,0 +1,87 @@
+# katabasis config — Qwen3.6-27B IQ4_NL, single-GPU baseline with full sweep.
+# Exercises: TTFT, multi-preset (niah + code), and concurrency [1, 2, 4].
+# Estimated wall time on RTX 6000 Ada: ~20-30 min (depending on reasoning length).
+name: "qwen3.6-27b iq4_nl MTP"
+
+hardware:
+  cuda_visible_devices: "0"
+  rig_label: "RTX 6000 ADA"
+
+server:
+  launch: true
+  # binary: omitted — llama-server is expected on $PATH. Override only if a
+  # specific build is needed (e.g., a sibling machine with a different path).
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/Qwen3.6-27B-MTP-GGUF:IQ4_NL
+    - --host: 0.0.0.0
+    - --jinja
+    - --batch-size: 8192
+    - --ubatch-size: 2048
+    # --parallel intentionally omitted — katabasis auto-bumps to match
+    # max_concurrency. Leaving it manually would just be redundant.
+    - --no-context-shift
+    - -fa: "on"
+    - --spec-type: draft-mtp
+    - --spec-draft-n-max: 3
+    - --reasoning: "on"
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    # --fit off: we're controlling the environment, want hard failures
+    # at startup rather than silent CPU spillover that invalidates the
+    # benchmark. With --fit on, llama-server silently moved 13 layers +
+    # 4 GB of context to Host memory on the 48 GB Ada and decode dropped
+    # to ~6 t/s (vs expected ~80 t/s) — invisible in early dashboard data.
+    - --fit: "off"
+    # --kv_unified and --ctx-size intentionally omitted — katabasis injects
+    # --kv_unified when max_concurrency > 1 and computes --ctx-size from
+    # the sweep math: (max_ctx + max_gen) × max(c) × 1.10 headroom. Setting
+    # them manually risks silent server-side request cancellation when the
+    # math is wrong. If you want a specific size you may set --ctx-size
+    # here; katabasis never reduces a user-set value, only bumps it up.
+
+sweep:
+  # Operator-aligned ctx (revised 2026-06-06; matches GB10 MTP config):
+  # nobody runs production at ctx=256 except accidentally at the start
+  # of a fresh chat. Three realistic operating points spanning 8×:
+  #   2048  — short prompt + system prompt + single Q&A
+  #   8192  — typical coding session, mid-length chat, modest RAG
+  #   16384 — long coding session, large doc analysis, heavy history
+  # Captures regime transition (decode-bound → transitional →
+  # prefill-bound) at values operators actually run. Matches GB10 sweep
+  # exactly so cross-rig A/B is a clean intersection.
+  context_sizes:  [2048, 8192, 16384]
+  # gen=512 to match the GB10 MTP config exactly for cross-rig comparison
+  # (gen=128 left commented — uncomment if you also want the short-output
+  # latency story, but it breaks like-for-like with GB10 results).
+  gen_sizes:      [512]
+  # gen_sizes:      [128, 512]
+
+  # Presets: niah | code | chat (or {file: /path/to/seed.txt}).
+  # Two presets show the spec-decoding output-domain gap (when you add a
+  # draft model). For pure throughput they should converge under the new
+  # token-weighted aggregation — divergence = real signal.
+  prompt_presets: [niah, code]
+
+  # Rolling ramp: c climbs 1..max_concurrency. GB10's matched config uses
+  # max_concurrency=16; Ada caps lower because 48 GB can't fit the full
+  # KV pool at c=16 × ctx=16384. The real per-c cost (measured from Ada's
+  # own fit-impl log on 2026-06-05) is ~1.2 GB/c-step at this ctx range —
+  # lower than naive estimates suggest because Qwen3.6 is hybrid SSM and
+  # only ~16 of 65 layers carry full attention KV. Empirically: c=8 needs
+  # ~27 GB (8 GB margin in 35 GB free), c=12 ~32 GB (3 GB margin), c=16
+  # needs 37 GB (overflows by 1.5 GB). max_c=8 picked for comfortable
+  # margin AND to reach the c_sat>1 boost region (GB10 peaks were c=7-15).
+  # Halves GB10's ramp horizon but covers the analytically-important range.
+  max_concurrency: 8
+
+  # Math: 2 presets × N ctx × N gen ≈ M cells. Each ramps up to ~16 c levels
+  # with prediction-verify shortcut on c≥4. Per-cell wall ≈ T_req(c=1) × 25
+  # for c=1 + ~T_req(c=1) × 13 for each verify level.
+
+output:
+  dir: runs
+  live: true
+  stream_tokens: true
+  gpu_monitor: true

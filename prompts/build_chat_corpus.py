@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""Generate prompts/chat_corpus.txt from hand-authored conversation seeds.
+
+Output is deterministic synthetic dialogue suitable for the `chat` preset.
+Each conversation block is independent — arbitrary truncation still yields
+a coherent-looking context.
+
+Usage:  python prompts/build_chat_corpus.py
+"""
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+
+
+# ---------- conversation seeds ---------------------------------------------
+# Each seed is a list of (role, text) turns. Wrap long lines so the corpus
+# tokenizes cleanly. Aim for ~5-10 KB per seed; ~6 seeds → ~40-50 KB total.
+
+SEEDS: list[tuple[str, list[tuple[str, str]]]] = []
+
+
+SEEDS.append(("Python async basics", [
+    ("User", "I keep getting \"coroutine was never awaited\" warnings in my "
+             "Python script. Can you explain what's going wrong and how I "
+             "should structure my code?"),
+    ("Assistant",
+     "That warning means you called an async function but never used `await` "
+     "or scheduled it with something like `asyncio.create_task` or "
+     "`asyncio.run`. In Python, calling an `async def` function returns a "
+     "coroutine object — it doesn't run yet. You have to hand it to an event "
+     "loop. The simplest fix is to make sure the entry point uses "
+     "`asyncio.run(main())` where `main()` is your top-level coroutine, and "
+     "every nested async call inside it is either awaited (`await fetch()`) "
+     "or scheduled (`task = asyncio.create_task(fetch())`). If you have a "
+     "function that takes a callback and you pass an async function to it, "
+     "that callback site may never await — and that's a classic source of "
+     "this warning."),
+    ("User",
+     "OK so I have a list of URLs and I want to fetch them all in parallel. "
+     "Right now my code looks like this: for url in urls: fetch(url). What's "
+     "the right way to do this?"),
+    ("Assistant",
+     "You want `asyncio.gather`. Replace the loop with: `results = await "
+     "asyncio.gather(*(fetch(url) for url in urls))`. That creates a "
+     "coroutine for each URL, schedules them all on the loop, and waits for "
+     "every one to finish, returning the results in order. If you want to "
+     "tolerate partial failures, pass `return_exceptions=True` and inspect "
+     "each result to see if it's an Exception instance. For very large "
+     "lists, you probably want to bound concurrency with an "
+     "`asyncio.Semaphore` — say `sem = asyncio.Semaphore(20)` — and wrap "
+     "each fetch in `async with sem:` so you never have more than 20 in "
+     "flight at once. Otherwise you'll exhaust file descriptors or get rate "
+     "limited by the remote server."),
+    ("User",
+     "What's the difference between `asyncio.gather` and "
+     "`asyncio.wait`? I've seen both in tutorials and I'm not sure which to use."),
+    ("Assistant",
+     "Both schedule a bunch of awaitables concurrently, but they return "
+     "different things and handle exceptions differently. `gather` returns a "
+     "list of results in input order; if any task raises, gather raises that "
+     "exception (and by default cancels the rest, unless you pass "
+     "`return_exceptions=True`). `wait` returns a pair `(done, pending)` of "
+     "task sets, with no ordering guarantee, and it never raises on your "
+     "behalf — you have to inspect each completed task's `.exception()` or "
+     "`.result()` yourself. Use `gather` when you want a clean list of "
+     "results matched up with your inputs, and `wait` when you need finer "
+     "control — for example, `wait(..., return_when=FIRST_COMPLETED)` to "
+     "implement a timeout race or to process tasks as they finish."),
+    ("User",
+     "How do I add a timeout? I want each fetch to give up after 5 seconds."),
+    ("Assistant",
+     "In modern Python (3.11+) the idiomatic way is `async with "
+     "asyncio.timeout(5):` around the await — it raises "
+     "`TimeoutError` if the block doesn't finish in time. For older Python, "
+     "use `asyncio.wait_for(fetch(url), timeout=5)`, which wraps the "
+     "coroutine and raises `asyncio.TimeoutError` (note the older alias) on "
+     "expiry. Either form cancels the inner work when the timer fires, so "
+     "your `fetch` should be cancellable — meaning it shouldn't catch and "
+     "swallow `CancelledError`, and any blocking I/O it does should be the "
+     "async kind. If you're calling into a sync library that blocks, the "
+     "timeout won't actually unblock it; you'd need to push that call into "
+     "a thread pool with `asyncio.to_thread` first."),
+    ("User",
+     "Last question — when should I use threads versus asyncio versus "
+     "multiprocessing? I find the choice confusing."),
+    ("Assistant",
+     "Rough rule of thumb. Use asyncio for I/O-bound concurrency with lots "
+     "of waiting — network requests, database queries, file I/O on platforms "
+     "that support it. The model is cooperative: only one piece of Python "
+     "runs at a time, but while one coroutine is waiting on the network, "
+     "another can make progress. Use threads when you need parallel I/O but "
+     "you're stuck calling sync libraries that don't have async equivalents "
+     "— `concurrent.futures.ThreadPoolExecutor` is the standard tool. Use "
+     "multiprocessing for CPU-bound work — number crunching, image "
+     "processing, anything that actually keeps the CPU busy — because the "
+     "GIL otherwise serializes Python threads. With multiprocessing each "
+     "worker has its own interpreter and GIL, so you really do get parallel "
+     "computation, at the cost of IPC overhead for sending data between "
+     "processes."),
+]))
+
+
+SEEDS.append(("Debugging a memory leak", [
+    ("User",
+     "I've got a long-running Python service that grows in memory over "
+     "time. RSS climbs about 20 MB per hour and never comes back down. "
+     "Where do I even start?"),
+    ("Assistant",
+     "First step is to confirm it's actually a leak and not just normal "
+     "fragmentation or caching behaviour. Take a few snapshots with "
+     "`tracemalloc` at increasing intervals — say startup, +1h, +4h — and "
+     "compare them. `tracemalloc.start()` at process start, then "
+     "`snapshot = tracemalloc.take_snapshot()` and "
+     "`snapshot.statistics('lineno')` to see top allocators. If the same "
+     "lines keep growing across snapshots, that's your suspect. "
+     "Alternatively, `objgraph.show_growth()` between intervals tells you "
+     "which Python object types are accumulating. Real leaks usually have a "
+     "specific shape: dicts that get keys added but never deleted, caches "
+     "without size bounds, listeners that get registered to long-lived "
+     "publishers without unregistering, or closures capturing references to "
+     "large objects."),
+    ("User",
+     "I ran tracemalloc and the biggest growing line is inside the json "
+     "module — `json/decoder.py:355`. That can't be the leak, right? It "
+     "must be something I'm doing with the parsed objects."),
+    ("Assistant",
+     "Almost certainly. `tracemalloc` shows the allocation site, not the "
+     "site that's holding the reference. The json decoder is creating dicts "
+     "and lists; something in your code is preventing them from being "
+     "collected. The next move is `tracemalloc.Snapshot.compare_to(...)` to "
+     "filter for newly allocated objects, then walk the reference graph "
+     "with `gc.get_referrers(obj)` to see who's holding them. Or use "
+     "`objgraph.show_backrefs([sample_object])` to render a graph showing "
+     "what's keeping it alive. Common culprits: caching the parsed response "
+     "in a dict keyed by request id that you forget to evict; storing it on "
+     "a class instance that lives forever; closures registered as "
+     "callbacks on a long-lived object; logging an entire payload with "
+     "`logger.debug(parsed)` where the log handler is buffering."),
+    ("User",
+     "Found it — there's a metrics class that records the last 1000 "
+     "responses in a list for debugging, but it was never bounded and we "
+     "stopped using it. Removing the append fixed the growth. Why didn't "
+     "the garbage collector clean up the old entries even after the list "
+     "got huge?"),
+    ("Assistant",
+     "Garbage collection in CPython is two layers. The reference counter "
+     "frees objects the moment their refcount drops to zero — but that only "
+     "works for objects nobody references. As long as your list held a "
+     "reference, every parsed response had refcount ≥ 1 and couldn't be "
+     "freed, no matter how much memory it consumed. The separate cyclic "
+     "garbage collector (`gc` module) only handles reference cycles — "
+     "objects that reference each other but are unreachable from the live "
+     "set. Your case wasn't a cycle, just a perfectly normal reachable list "
+     "that nobody was going to look at. Python had no way of knowing the "
+     "code didn't intend to use that list later."),
+    ("User",
+     "Are there patterns I can adopt to prevent this kind of mistake in "
+     "the future?"),
+    ("Assistant",
+     "A few habits help. Always use `functools.lru_cache(maxsize=N)` "
+     "instead of a hand-rolled dict cache, since it enforces a bound. For "
+     "buffers, `collections.deque(maxlen=N)` is similar — old entries fall "
+     "off the back automatically. Where you must use a raw dict or list, "
+     "set a budget and add an assertion: `assert len(self.cache) < 10000` "
+     "blows up in dev before it leaks in prod. Use weak references "
+     "(`weakref.WeakValueDictionary`) when you want a cache that doesn't "
+     "prevent its values from being garbage-collected — useful for "
+     "instance caches keyed by an external lifecycle. And periodically run "
+     "your service in a stress harness with `tracemalloc` enabled; a clean "
+     "service running for an hour should have nearly identical memory "
+     "snapshots at hour 1 and hour 2."),
+]))
+
+
+SEEDS.append(("How the kidney works", [
+    ("User",
+     "I had a basic biology class in high school but never really "
+     "understood how the kidney works. Can you walk me through it from "
+     "scratch?"),
+    ("Assistant",
+     "Sure. At the highest level, the kidney's job is to filter your blood: "
+     "it removes waste products from metabolism, balances water and "
+     "electrolytes, and adjusts blood pH. You have two kidneys, each about "
+     "the size of a fist, sitting in the back of your abdomen. The "
+     "functional unit inside is called a nephron, and each kidney has about "
+     "a million of them. A nephron is a tiny tube with a specialized filter "
+     "at one end and a collection point at the other. Blood enters the "
+     "filter end, water and small molecules pass through into the tube, "
+     "and as that fluid moves down the tube the kidney selectively pulls "
+     "back the things it wants to keep — most of the water, all of the "
+     "glucose, most of the salts — while letting waste continue to the "
+     "bladder as urine."),
+    ("User",
+     "So filtration and reabsorption are two different steps?"),
+    ("Assistant",
+     "Exactly. The first step happens in a structure called the glomerulus, "
+     "which is a tuft of leaky capillaries surrounded by a cup-shaped "
+     "membrane. Blood pressure pushes about 20% of the plasma through the "
+     "capillary walls into the cup, producing roughly 180 liters of "
+     "filtrate per day. That's far more than your blood volume, so clearly "
+     "almost all of it has to come back. The second step happens along the "
+     "rest of the nephron — the proximal tubule, the loop of Henle, the "
+     "distal tubule, and the collecting duct. Each region reabsorbs "
+     "specific things using different mechanisms: the proximal tubule "
+     "pulls back most of the glucose, amino acids, and bicarbonate; the "
+     "loop of Henle uses a clever countercurrent mechanism to recover "
+     "water against an osmotic gradient; the distal tubule fine-tunes "
+     "sodium, potassium, and acid-base balance under hormonal control."),
+    ("User",
+     "What does the countercurrent mechanism actually do? I've heard the "
+     "phrase but it sounds like a buzzword."),
+    ("Assistant",
+     "It's a beautifully economical way to recover water without spending "
+     "energy on pumping water itself. The loop of Henle dives deep into "
+     "the kidney's interior and loops back. The descending limb is "
+     "permeable to water but not to salt; the ascending limb is the "
+     "opposite — it pumps salt out but is impermeable to water. The "
+     "result is that the surrounding tissue (the medulla) becomes "
+     "extremely salty toward the bottom of the loop, gradually more dilute "
+     "near the surface. When the filtrate later passes through the "
+     "collecting duct on its way to the bladder, the duct traverses this "
+     "same salt gradient. If the body needs to conserve water, the "
+     "collecting duct opens water channels and water flows out of the "
+     "filtrate down the osmotic gradient back into the body, leaving "
+     "concentrated urine behind. If you're well hydrated, those channels "
+     "stay closed and you produce dilute urine."),
+    ("User",
+     "What controls whether the water channels are open or closed?"),
+    ("Assistant",
+     "A hormone called vasopressin, also known as antidiuretic hormone or "
+     "ADH. It's released by the posterior pituitary in response to signals "
+     "from the hypothalamus, which monitors blood osmolality through "
+     "specialized neurons. When you're dehydrated, blood osmolality rises, "
+     "those neurons fire more, ADH is released, and it tells cells in the "
+     "collecting duct to insert water channels (aquaporins) into their "
+     "membranes. Water flows back into the body. When you drink a lot of "
+     "water, ADH drops, the channels are removed, and the duct becomes "
+     "water-impermeable — you pee out the excess. Alcohol suppresses ADH, "
+     "which is why drinking causes increased urination and dehydration. "
+     "Diabetes insipidus is the condition where either ADH isn't released "
+     "properly or the kidney doesn't respond to it; people with it produce "
+     "enormous volumes of dilute urine and have to drink constantly to "
+     "keep up."),
+    ("User",
+     "Where does blood pressure regulation fit in? I know the kidney is "
+     "involved but I don't know how."),
+    ("Assistant",
+     "Several mechanisms. The most famous is the renin-angiotensin-"
+     "aldosterone system (RAAS). When the kidney senses low blood pressure "
+     "or low sodium delivery, specialized cells in the afferent arteriole "
+     "release an enzyme called renin into the bloodstream. Renin cleaves a "
+     "liver-made protein called angiotensinogen into angiotensin I, which "
+     "is then converted to angiotensin II in the lungs by another enzyme "
+     "(ACE — the target of common blood pressure drugs called ACE "
+     "inhibitors). Angiotensin II is a powerful vasoconstrictor, raising "
+     "blood pressure directly, and it also triggers the adrenal gland to "
+     "release aldosterone, which tells the distal tubule to reabsorb more "
+     "sodium and water — increasing blood volume and pressure further. "
+     "It's a multi-organ cascade with the kidney as the sensor and "
+     "instigator. Many heart-failure and hypertension treatments target "
+     "different points along this cascade."),
+]))
+
+
+SEEDS.append(("Writing a short story", [
+    ("User",
+     "I'm trying to write a short story but it feels flat. The plot makes "
+     "sense but nothing really happens emotionally. Can you give me some "
+     "general advice on what to look at?"),
+    ("Assistant",
+     "Flat usually means one of three things: the protagonist doesn't want "
+     "anything strongly enough; nothing in the story actively opposes that "
+     "want; or the want and the obstacle don't change the character by the "
+     "end. Try this diagnostic on your draft. Write down, in one sentence "
+     "each: What does the protagonist want at the start? Who or what is "
+     "stopping them? What do they learn or lose or become by the end? If "
+     "any of those is fuzzy, the reader will feel the fuzziness as "
+     "flatness, even if the prose is good. Often what makes a story land "
+     "isn't a bigger event — it's making the existing events matter to "
+     "the protagonist in a way the reader can feel."),
+    ("User",
+     "OK so my character is a retired teacher who finds her old diary "
+     "from when she was 17. The plot is that she reads it and decides to "
+     "go reconnect with her first boyfriend, who she finds out has died. "
+     "She comes home and writes a new diary. What's wrong with that?"),
+    ("Assistant",
+     "Honestly, the bones are fine. There's a want (reconnect with a lost "
+     "past), an obstacle (he's dead and can't be reconnected with), and a "
+     "transformation (she writes a new diary instead of looking backward). "
+     "What might be making it flat is *insulation*. As you've described "
+     "it, the reader watches her go through these events but doesn't "
+     "necessarily live them. Show her in the moment she opens the diary — "
+     "the smell of old paper, the handwriting she barely recognizes, the "
+     "names she'd half-forgotten. Show her hesitating before she decides "
+     "to go find him. Show her at his front door — and then the moment "
+     "she learns. Don't summarize it. Don't say 'she was sad.' Show her "
+     "noticing something irrelevant, like a wind chime, because her mind "
+     "can't take in the news directly. Specificity earns emotion."),
+    ("User",
+     "How do I decide what's worth showing in detail versus skipping?"),
+    ("Assistant",
+     "Show the moments where something *changes inside the character*. "
+     "Skip the moments that just move them physically from one place to "
+     "another. A useful rule: scenes earn their length by altering what "
+     "the protagonist believes, wants, or fears. If she takes a train to "
+     "find him and the train ride doesn't change anything, you can "
+     "compress it to a paragraph or a single line — 'three hours later, "
+     "she stood at his door.' If the train ride contains the moment she "
+     "rehearses what she'll say and realizes she doesn't know what she "
+     "wants to say, then the train ride is a scene and deserves a page. "
+     "Length follows internal change."),
+    ("User",
+     "What about dialogue? Mine all sounds like people exchanging "
+     "information. How do I make it feel like real talk?"),
+    ("Assistant",
+     "Real talk almost never directly exchanges information. People dodge "
+     "the topic, talk past each other, ask questions that aren't really "
+     "questions, repeat themselves when nervous, change the subject when "
+     "the truth gets close. Read your dialogue aloud — if it sounds like a "
+     "transcript of an interview, it's too clean. Try this exercise: take "
+     "a scene where character A tells character B something important. "
+     "Rewrite it so A never actually says the thing. They circle it, they "
+     "approach it sideways, they make a joke about it, B fills in the "
+     "blank or refuses to. Often that version is twice as alive as the "
+     "direct one, because it's how people actually behave when something "
+     "matters. Also: cut dialogue tags wherever the speaker is obvious "
+     "from context. 'Said' is invisible; 'opined' and 'exclaimed' are "
+     "speed bumps."),
+    ("User",
+     "Last one — how do I know when a draft is done? I keep tweaking and "
+     "I can't tell anymore."),
+    ("Assistant",
+     "When the changes you're making are no longer making it better, they "
+     "are making it different. That's the signal to stop and either submit "
+     "it, share it with readers, or set it aside for two weeks and re-read "
+     "with fresh eyes. The danger of endless tweaking isn't that the "
+     "story gets worse — it's that you lose the perspective to tell. "
+     "Writers who finish things tend to use external deadlines or "
+     "external readers as their forcing function. Don't aim for "
+     "perfection; aim for the best version of *this* draft, and trust "
+     "that you'll write a better one next time. Every story you finish "
+     "teaches you things the unfinished ones can't."),
+]))
+
+
+SEEDS.append(("Roman Republic to Empire", [
+    ("User",
+     "I'd love a basic overview of how Rome went from a republic to an "
+     "empire. I know names like Julius Caesar and Augustus but I don't "
+     "really understand the transition."),
+    ("Assistant",
+     "The transition wasn't a single event but a roughly century-long "
+     "breakdown of the republican system under the pressure of its own "
+     "success. The Roman Republic, founded around 509 BCE, had a "
+     "constitution designed for a city-state: two consuls elected annually, "
+     "a Senate of former officials advising them, and various popular "
+     "assemblies for legislation and elections. It worked because magistrates "
+     "stepped down on time, generals disbanded their armies after wars, and "
+     "no one accumulated power that outlasted their term. That system was "
+     "stress-tested past its breaking point by the conquest of the "
+     "Mediterranean in the 3rd and 2nd centuries BCE. Suddenly the city "
+     "controlled vast provinces, professional armies loyal to commanders "
+     "rather than the state, and an economy where land and wealth "
+     "concentrated in the hands of a few. The institutions designed for "
+     "village governance couldn't hold."),
+    ("User",
+     "What were the first cracks?"),
+    ("Assistant",
+     "The Gracchi brothers are usually cited as the start, around 133 BCE. "
+     "Tiberius and later Gaius Gracchus were tribunes — magistrates who "
+     "could veto Senate actions on behalf of the common people — and they "
+     "pushed land redistribution and grain subsidy laws that the Senate "
+     "saw as a threat to property and to their own authority. Both were "
+     "killed by mobs orchestrated by senators, which shattered a long-"
+     "standing taboo against political violence. Once that line was "
+     "crossed, every faction realized force was an option. Over the "
+     "following decades, military strongmen like Marius and Sulla used "
+     "their legions to influence politics directly. Sulla actually "
+     "marched his army on Rome in 88 BCE — the first time a Roman general "
+     "had attacked the city — and later had himself appointed dictator to "
+     "rewrite the constitution by purge and proscription. He resigned "
+     "voluntarily, but the precedent was set: armies could decide who "
+     "ruled."),
+    ("User",
+     "And then Caesar?"),
+    ("Assistant",
+     "Caesar was the inheritor of that pattern. He spent the 50s BCE "
+     "conquering Gaul, accumulating wealth, military glory, and a deeply "
+     "loyal veteran army. When the Senate, alarmed and partly manipulated "
+     "by his rival Pompey, demanded he disband and return as a private "
+     "citizen, he refused — he knew he'd be prosecuted to political "
+     "oblivion. He crossed the Rubicon river with his army in 49 BCE, "
+     "which was illegal because generals were forbidden from bringing "
+     "armed forces into Italy proper, and launched a civil war he won "
+     "within five years. He had himself declared dictator for life in "
+     "44 BCE, and was assassinated weeks later by a Senate conspiracy that "
+     "imagined they were restoring the Republic. They weren't. The "
+     "machinery of republican government had been broken by 80 years of "
+     "concentrated military and political power; killing one man didn't "
+     "put it back together."),
+    ("User",
+     "So what made Augustus different from Caesar? Why did his version "
+     "stick?"),
+    ("Assistant",
+     "Augustus — originally Octavian, Caesar's adopted heir — won the "
+     "ensuing civil wars by 31 BCE, but he was very careful not to repeat "
+     "Caesar's political mistakes. Caesar had been killed for being "
+     "openly monarchical: he wore the trappings of kingship, he wouldn't "
+     "stand when senators approached, he took titles that suggested he "
+     "considered himself above the law. Augustus did all the same things "
+     "in substance — he controlled the army, the provinces, the public "
+     "purse, the religious offices — but he wrapped it in republican "
+     "language. He called himself princeps, 'first citizen,' not king or "
+     "emperor. He refused most of the unprecedented honors offered to "
+     "him. He held conventional magistracies under their conventional "
+     "names, just held them simultaneously and indefinitely. The Senate "
+     "still met; elections still happened; the appearance of the Republic "
+     "was carefully preserved while the substance became autocratic. He "
+     "called this arrangement 'the restored Republic,' and he died in his "
+     "bed at 75 after ruling for 41 years. The form he established lasted "
+     "for centuries because it gave everyone the language to pretend "
+     "nothing had really changed."),
+    ("User",
+     "It's striking how slow it was. Nothing like a single revolution."),
+    ("Assistant",
+     "That's a recurring pattern in constitutional collapses, actually. "
+     "The forms persist long after the substance has hollowed out, because "
+     "people are invested in the forms and because the forms shield "
+     "whoever's currently in power from accountability. Each generation "
+     "tells itself the system is still working because it can point to "
+     "elections happening, senators speaking, laws being passed. The "
+     "deeper question — does any of this still constrain the people with "
+     "actual power? — gets asked too late, by historians. Late Republican "
+     "Romans wrote a lot about virtue, decline, and the corruption of the "
+     "old ways. Cicero in particular spent his life trying to argue the "
+     "Republic back into existence through rhetoric. He didn't realize the "
+     "Republic he was defending had already become a stage set. He was "
+     "executed in 43 BCE for opposing the wrong general."),
+]))
+
+
+SEEDS.append(("Choosing a career path", [
+    ("User",
+     "I'm 28 and I have a stable but boring corporate job. I keep "
+     "thinking about leaving to do something more meaningful but I have "
+     "no idea what. Any advice on how to think about this?"),
+    ("Assistant",
+     "A few framings might help, none of them complete. First: 'meaningful' "
+     "is a slippery word and worth defining for yourself before you act. "
+     "Some people mean intellectually engaging work; some mean work that "
+     "helps others; some mean autonomy or creative expression; some mean "
+     "earning enough to spend their non-work hours on what they value. "
+     "These often lead in opposite directions. A doctor in a busy clinic "
+     "helps people directly but has little autonomy; a freelance writer "
+     "has autonomy but may not help anyone in particular. Get specific "
+     "about what 'meaningful' actually means to you, because the answer "
+     "shapes the search."),
+    ("User",
+     "I think I mostly mean: I want to feel like what I do matters to "
+     "someone, and I want to keep growing. Right now I do PowerPoints "
+     "that get edited by my manager into other PowerPoints."),
+    ("Assistant",
+     "Those are two distinct things, and you can probably get both "
+     "without a dramatic career switch. The 'mattering' part is often "
+     "available in the current job if you find the people downstream of "
+     "your work and learn what they actually use it for. PowerPoints "
+     "that get edited into other PowerPoints sounds like the famous "
+     "consultant problem — your output is an input to someone else's "
+     "output, and you've lost sight of the customer at the end. Try to "
+     "find them. Sometimes that exercise reveals the work does matter "
+     "and you just couldn't feel it. Sometimes it reveals nobody can "
+     "really explain who uses your work, which tells you something else. "
+     "The 'growing' part is more about you than the job — you can build "
+     "skills outside your current role, and the question of whether to "
+     "leave depends on whether your current employer will let you "
+     "develop laterally or you have to leave to do so."),
+    ("User",
+     "What about the financial risk? I have some savings but not a ton."),
+    ("Assistant",
+     "Take it seriously without letting it become an excuse. The standard "
+     "advice is to have 6-12 months of essential expenses saved before "
+     "making a discontinuous career move, and to know what your monthly "
+     "burn rate actually is — not what you think it is. Track every "
+     "expense for two months and you'll often discover you spend "
+     "differently than you'd guess. Then ask: what's the minimum income "
+     "you'd need to keep your current life, and what's the minimum "
+     "income you'd accept if you stripped down to essentials? Those two "
+     "numbers define the boundaries of your runway. Many career changes "
+     "are possible without complete income disruption — moving within "
+     "your industry to a smaller team where the work is more visible, "
+     "negotiating a sabbatical, doing a side project that proves out "
+     "the new direction before you bet on it. Discontinuous leaps are "
+     "the most dramatic option, not necessarily the best one."),
+    ("User",
+     "What do you think about taking a year off to figure things out?"),
+    ("Assistant",
+     "Honest answer: it works for some people and not others. The risk "
+     "isn't financial — it's that unstructured time without a project "
+     "tends to expand the question rather than answer it. People who "
+     "take a year off and use it to deeply pursue something specific "
+     "(write a novel, learn carpentry, walk across a country, work on a "
+     "startup) often come back transformed. People who take a year off "
+     "to 'figure things out' often spend it in a low-grade anxiety "
+     "loop, because removing the structure of a job doesn't replace it "
+     "with anything. If you take time off, give yourself a concrete "
+     "project to attack — even one you're not sure about. You'll learn "
+     "more from six months of trying something than from twelve months "
+     "of considering things."),
+    ("User",
+     "How do I know when I'm being thoughtfully cautious versus just "
+     "scared and rationalizing?"),
+    ("Assistant",
+     "A useful diagnostic: are you avoiding making any decision at all? "
+     "Thoughtful caution usually narrows options and produces an "
+     "incremental plan. Rationalized fear tends to produce an endless "
+     "list of reasons why nothing yet is the right move, while the years "
+     "go by. Another sign: if every time you talk about leaving you "
+     "discover a new objection you hadn't raised before, the objections "
+     "are probably motivated rather than discovered. Try writing down "
+     "your top three concerns about leaving today, sealed in an envelope. "
+     "Six months from now, open it. If the list has substantially changed "
+     "and grown, you're using analysis as a defense mechanism. If it's "
+     "shrunk because you've actually addressed items, you're working on "
+     "the right thing. Decisions in life don't have to be perfect — they "
+     "have to be timely enough that you're still the person who chose "
+     "them."),
+]))
+
+
+# ---------- assembly --------------------------------------------------------
+
+
+def wrap_text(s: str, width: int = 78) -> str:
+    """Wrap a single string at the given width, preserving paragraph breaks."""
+    paragraphs = s.split("\n")
+    out = []
+    for p in paragraphs:
+        if not p.strip():
+            out.append("")
+            continue
+        out.extend(textwrap.wrap(p, width=width) or [""])
+    return "\n".join(out)
+
+
+def render() -> str:
+    parts: list[str] = []
+    header = Path(__file__).with_name("chat_corpus.txt").read_text().split(
+        "[BEGIN CONVERSATION:")[0].rstrip()
+    parts.append(header)
+    parts.append("")
+    for title, turns in SEEDS:
+        parts.append(f"[BEGIN CONVERSATION: {title}]")
+        parts.append("")
+        for role, text in turns:
+            parts.append(f"{role}: {wrap_text(text)}")
+            parts.append("")
+        parts.append(f"[END CONVERSATION: {title}]")
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def main() -> None:
+    out_path = Path(__file__).with_name("chat_corpus.txt")
+    out_path.write_text(render())
+    print(f"wrote {out_path} ({out_path.stat().st_size} bytes, {len(SEEDS)} conversations)")
+
+
+if __name__ == "__main__":
+    main()

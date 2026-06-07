@@ -1,0 +1,68 @@
+# katabasis config — Qwen3.6-27B IQ4_NL, single-GPU baseline with full sweep.
+# Exercises: TTFT, multi-preset (niah + code), and concurrency [1, 2, 4].
+# Estimated wall time on RTX 6000 Ada: ~20-30 min (depending on reasoning length).
+name: "qwen3.6-27b iq4_nl MTP"
+
+hardware:
+  cuda_visible_devices: "1"
+  rig_label: "RTX PRO 6000"
+
+server:
+  launch: true
+  # binary: omitted — llama-server is expected on $PATH. Override only if a
+  # specific build is needed (e.g., a sibling machine with a different path).
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/Qwen3.6-27B-MTP-GGUF:IQ4_NL
+    - --host: 0.0.0.0
+    - --jinja
+    - --batch-size: 8192
+    - --ubatch-size: 2048
+    # --parallel intentionally omitted — katabasis auto-bumps to match
+    # max_concurrency. Leaving it manually would just be redundant.
+    - --no-context-shift
+    - -fa: "on"
+    - --spec-type: draft-mtp
+    - --spec-draft-n-max: 3
+    - --reasoning: "on"
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    - --fit: "on"
+    # --kv_unified and --ctx-size intentionally omitted — katabasis injects
+    # --kv_unified when max_concurrency > 1 and computes --ctx-size from
+    # the sweep math: (max_ctx + max_gen) × max(c) × 1.10 headroom. Setting
+    # them manually risks silent server-side request cancellation when the
+    # math is wrong. If you want a specific size you may set --ctx-size
+    # here; katabasis never reduces a user-set value, only bumps it up.
+
+sweep:
+  # Context spans 64× (256 → 16384). At the smallest, prefill is fast and
+  # TTFT is dominated by RTT; at the largest, prefill dominates and the
+  # TTFT-vs-context plot becomes the headline chart.
+  context_sizes:  [256, 1024, 4096, 16384]
+  # Two gen sizes — short (latency-sensitive) and medium (steady-state
+  # decode). Going beyond 1024 would mostly add wall time without new signal.
+  gen_sizes:      [128, 512]
+
+  # Presets: niah | code | chat (or {file: /path/to/seed.txt}).
+  # Two presets show the spec-decoding output-domain gap (when you add a
+  # draft model). For pure throughput they should converge under the new
+  # token-weighted aggregation — divergence = real signal.
+  prompt_presets: [niah, code]
+
+  # Rolling ramp: c climbs 1..max_concurrency, in-flight capped at c, fixed
+  # target rate = c / T_req(c=1). Stops when per-req decode < 10% of c=1
+  # baseline OR max_concurrency reached. The c=1 baseline + aggregate peak
+  # are the headline numbers; see project_no_knee_framing memory.
+  max_concurrency: 16
+
+  # Math: 2 presets × N ctx × N gen ≈ M cells. Each ramps up to ~16 c levels
+  # with prediction-verify shortcut on c≥4. Per-cell wall ≈ T_req(c=1) × 25
+  # for c=1 + ~T_req(c=1) × 13 for each verify level.
+
+output:
+  dir: runs
+  live: true
+  stream_tokens: true
+  gpu_monitor: true

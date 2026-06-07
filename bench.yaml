@@ -1,0 +1,54 @@
+# katabasis config — first light: Qwen3.6-27B IQ4_NL, no MTP/draft (baseline).
+# Mirrors /mnt/ssd/llm/qwen/qwen36-27BQ4-NOMTP.sh.
+name: "qwen3.6-27b iq4_nl baseline"
+
+hardware:
+  cuda_visible_devices: "0"
+  rig_label: "rig"
+
+server:
+  launch: true
+  # binary: omitted — defaults to `llama-server` on $PATH. Set to an explicit
+  # path only if you need a specific build.
+  endpoint: http://localhost:8080
+  health_timeout_s: 300
+  args:
+    - --hf-repo: unsloth/Qwen3.6-27B-MTP-GGUF:IQ4_NL
+    - --host: 0.0.0.0
+    - --jinja
+    - --batch-size: 8192
+    - --parallel: 2
+    - --no-context-shift
+    - -fa: "on"
+    - --spec-type: none
+    - --spec-draft-n-max: 3
+    - --reasoning: "on"
+    - --cache-type-k: q8_0
+    - --cache-type-v: q8_0
+    - --fit: "on"
+    - --kv_unified
+
+sweep:
+  # context_sizes: how many tokens are in context at decode-start.
+  context_sizes: [128, 512, 2048]
+  gen_sizes:     [64, 256]
+  rounds:        2
+  warmup_rounds: 1
+  # prompt_presets: list of corpora to iterate. Each preset produces a different
+  # output domain, which matters a lot for speculative-decoding acceptance.
+  # Built-ins:
+  #   niah  — needle-in-a-haystack (Pride & Prejudice excerpt + retrieval Qs)
+  #   code  — Python source + refactor task (high spec-accept domain)
+  #   chat  — synthetic dialogue + summarize task
+  # Use `{file: /path/to/seed.txt}` for your own corpus.
+  prompt_presets: [niah]
+  # concurrency_levels: parallel-request batching. Default [1] = today's
+  # behavior. Setting e.g. [1, 2, 4] adds the multi-user workgroup story
+  # to your run — katabasis auto-bumps the server's --parallel to match.
+  # concurrency_levels: [1, 2, 4]
+
+output:
+  dir: runs
+  live: true
+  stream_tokens: true
+  gpu_monitor: true
