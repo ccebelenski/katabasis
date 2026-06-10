@@ -1,11 +1,9 @@
 # katabasis config — Qwen3.6-27B IQ4_NL, single-GPU baseline with full sweep.
-# Exercises: TTFT, multi-preset (niah + code), and concurrency [1, 2, 4].
-# Estimated wall time on RTX 6000 Ada: ~20-30 min (depending on reasoning length).
 name: "qwen3.6-27b iq4_nl MTP"
 
 hardware:
   cuda_visible_devices: "0"
-  rig_label: "DGX GB10"
+  rig_label: "DGX SPARK GB10"
 
 server:
   launch: true
@@ -24,7 +22,7 @@ server:
     - --no-context-shift
     - -fa: "on"
     - --spec-type: draft-mtp
-    - --spec-draft-n-max: 3
+    - --spec-draft-n-max: 2
     - --reasoning: "on"
     - --cache-type-k: q8_0
     - --cache-type-v: q8_0
@@ -50,11 +48,11 @@ sweep:
   #   16384 — long coding session, large doc analysis, heavy history
   # Covers the regime transition (decode-bound → transitional →
   # prefill-bound) without spending wall time on values no operator hits.
-  context_sizes:  [2048, 8192, 16384]
+  context_sizes:  [2048, 8192]
   # gen=512 is the headline sustained-decode size. gen=128 is left commented
   # because niah always EOSes at ~24 tokens and code amortizes setup poorly
   # at 128 — uncomment if you want the short-output story too.
-  gen_sizes:      [512]
+  gen_sizes:      [512, 1024]
   # gen_sizes:      [128, 512]
 
   # Presets: niah | code | chat (or {file: /path/to/seed.txt}).
@@ -68,7 +66,7 @@ sweep:
   # OR max_concurrency is reached. Aggregate peak and per-req <50% knee
   # are labeled along the way. See project_design_decisions memory for
   # full rationale.
-  max_concurrency: 16
+  max_concurrency: 4 
 
   # Math: 2 presets × 3 ctx × 1 gen = 6 cells. Each ramps up to ~16 c levels
   # with 13-30 samples per level (verify shortcut on c≥4). Walltime per cell
