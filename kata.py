@@ -307,6 +307,91 @@ VERIFY_WINDOW_N = 8
 VERIFY_TOLERANCE_UNDER = 0.10
 VERIFY_TOLERANCE_OVER = 0.30
 
+# Early-convergence short-circuit. The standard stability bar requires
+# STABILITY_WINDOW_N steady samples before the CI check is consulted at
+# all — a hard wall-time floor of ~(TRANSIENT_DISCARD_N +
+# STABILITY_WINDOW_N) × T_req per full level even when the data is dead
+# quiet (greedy c=1 decode on a healthy rig). These knobs let the CI
+# check run earlier under a STRICTER bar: from EARLY_STABILITY_MIN_N
+# steady samples, exit "converged-early" only when the Student-t CI
+# half-width over ALL steady samples is under
+# EARLY_STABILITY_CI_REL_THRESHOLD (half the standard threshold) on
+# EARLY_STABILITY_CONSECUTIVE consecutive new samples. The early tier
+# uses the t critical value rather than the standard bar's z=1.96 —
+# z understates CI width exactly where this tier lives (t=2.57 at n=6,
+# 2.36 at n=8), so the t-CI self-penalizes small samples and the floor
+# can sit lower without loosening the real bar. The tighter threshold
+# plus the consecutive-pass requirement compensates for the
+# optional-stopping bias introduced by peeking before the full window.
+# On noisy levels this never fires and behavior is identical to the
+# standard path.
+EARLY_STABILITY_MIN_N = 6
+EARLY_STABILITY_CI_REL_THRESHOLD = 0.05
+EARLY_STABILITY_CONSECUTIVE = 2
+
+# Ultra-quiet short-circuit ("converged-tight"). Greedy decoding of a
+# fixed prompt is near-deterministic: when every steady sample so far
+# lands within a TIGHT_BAND_REL_RANGE total spread, the mean is pinned
+# by the range bound regardless of distributional assumptions — more
+# samples cannot move it materially, no CI required. Exit from
+# TIGHT_BAND_MIN_N steady samples when relative range (max-min)/mean
+# over ALL steady samples passes on TIGHT_BAND_CONSECUTIVE consecutive
+# samples. Because every new sample must stay inside the band, slow
+# drift (thermal clock decay, VRAM pressure) widens the range and
+# blocks this exit instead of being averaged away — strictly safer
+# against drift than a CI over the same n.
+TIGHT_BAND_MIN_N = 5
+TIGHT_BAND_REL_RANGE = 0.02
+TIGHT_BAND_CONSECUTIVE = 2
+
+# Within-level drift detection — fail-loud companion to the early exits.
+# A monotonic decode-t/s slide inside a single level is not noise; it's
+# a rig problem (thermal throttling, power cap, clock decay) and the
+# operator should know immediately, not discover it in post-run review.
+# Flagged when the second-half mean of steady samples differs from the
+# first-half mean by more than DRIFT_WARN_REL AND at least
+# DRIFT_WARN_SIGN_FRAC of consecutive sample deltas share that
+# direction (distinguishes a slide from symmetric noise). Informational
+# warning, never a stop signal — the run continues, the operator
+# decides. Note the tight-band exit is inherently drift-blocked (a
+# slide widens the range), but the CI paths are not: low-variance drift
+# passes any CI check, which is exactly why this is a separate check.
+DRIFT_WARN_MIN_N = 6
+DRIFT_WARN_REL = 0.03
+DRIFT_WARN_SIGN_FRAC = 0.7
+
+# Adaptive transient detection for the c=1 baseline. At c=1 completions
+# are serial (fire-on-completion), so the queue-drain rationale behind
+# the fixed TRANSIENT_DISCARD_N does not apply — the transient is
+# typically just the first request (cold prefill of this prompt, CUDA
+# graph warmup). Steady state is declared at the first sample (idx >=
+# C1_TRANSIENT_MIN_DISCARD) whose decode_tps agrees with its
+# predecessor within C1_TRANSIENT_AGREE_TOL. If no two consecutive
+# samples agree before the fixed discard is reached, falls back to
+# TRANSIENT_DISCARD_N — identical to the old behavior. c>=2 levels keep
+# the fixed discard unconditionally (queue drain is real there).
+C1_TRANSIENT_MIN_DISCARD = 1
+C1_TRANSIENT_AGREE_TOL = 0.05
+
+# Sequential verify decisions. The fixed VERIFY_WINDOW_N window makes
+# exactly one accept/reject decision after 8 steady samples land. When
+# the evidence is decisive earlier, waiting for the full window is pure
+# over-sampling, in both directions:
+# - early ACCEPT once VERIFY_EARLY_MIN_N samples are in and every one
+#   of them individually sits within VERIFY_EARLY_ACCEPT_FRAC ×
+#   tolerance of the prediction (comfortably inside — a stricter bar
+#   than the full window's mean-based test, which is what justifies
+#   deciding on fewer samples).
+# - early REJECT once VERIFY_EARLY_REJECT_MIN_N samples are in and the
+#   running mean deviates beyond VERIFY_EARLY_REJECT_FRAC × tolerance
+#   (clearly broken — fall back to full measurement immediately rather
+#   than finishing the window first).
+# Ambiguous evidence falls through to the standard full-window decision.
+VERIFY_EARLY_MIN_N = 4
+VERIFY_EARLY_ACCEPT_FRAC = 0.5
+VERIFY_EARLY_REJECT_MIN_N = 3
+VERIFY_EARLY_REJECT_FRAC = 1.5
+
 
 def wait_for_health(endpoint: str, timeout_s: float, console: Console) -> None:
     deadline = time.time() + timeout_s
@@ -1664,7 +1749,8 @@ def _predict_per_req(c: int, fit: dict | None) -> float | None:
 
 def _ci_relative_halfwidth(values: list[float]) -> float:
     """95% CI half-width as a fraction of the mean. Used by the ramp's
-    stability test. Returns +inf if mean is zero or sample is too small."""
+    standard stability test (n >= STABILITY_WINDOW_N, where z is fine).
+    Returns +inf if mean is zero or sample is too small."""
     if len(values) < 2:
         return float("inf")
     m = sum(values) / len(values)
@@ -1674,6 +1760,32 @@ def _ci_relative_halfwidth(values: list[float]) -> float:
     sd = var ** 0.5
     ci_half = 1.96 * sd / (len(values) ** 0.5)
     return ci_half / m
+
+
+# Two-sided 95% Student-t critical values by degrees of freedom. The early
+# stability tier decides on n=6..19 samples, where z=1.96 understates the
+# CI half-width by 7-30% — using t keeps the early exit honest without
+# pulling in scipy.
+_T_CRIT_95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45,
+              7: 2.36, 8: 2.31, 9: 2.26, 10: 2.23, 11: 2.20, 12: 2.18,
+              13: 2.16, 14: 2.14, 15: 2.13, 16: 2.12, 17: 2.11,
+              18: 2.10, 19: 2.09}
+
+
+def _ci_relative_halfwidth_t(values: list[float]) -> float:
+    """Like _ci_relative_halfwidth but with the Student-t critical value —
+    required for honesty at the small n where the early stability tier
+    operates. Falls back to z for df >= 20 (difference is negligible)."""
+    n = len(values)
+    if n < 2:
+        return float("inf")
+    m = sum(values) / n
+    if m <= 0:
+        return float("inf")
+    var = sum((v - m) ** 2 for v in values) / (n - 1)
+    sd = var ** 0.5
+    crit = _T_CRIT_95.get(n - 1, 1.96)
+    return (crit * sd / (n ** 0.5)) / m
 
 
 def _write_row(raw_f, raw_lock, result: dict, *, preset: str,
@@ -1728,18 +1840,23 @@ def _run_level(*, endpoint: str, prompt: str, gen_size: int,
     open-loop with rate=target; at saturation it naturally becomes "fill
     slots as they free" (sustained-N closed-loop semantics).
 
-    If `verify_prediction` is set, the level exits early once VERIFY_WINDOW_N
-    steady-state samples are in AND their mean per_req is within the
-    asymmetric verify tolerance (VERIFY_TOLERANCE_UNDER for shortfalls below
-    prediction, VERIFY_TOLERANCE_OVER for surpluses above — see those
-    constants for why). Mode is set to "verified" in that case. If outside
-    tolerance, falls through to full measurement (mode ends as "converged"
-    or "max_samples").
+    If `verify_prediction` is set, the level runs a sequential verify test
+    against the asymmetric tolerance (VERIFY_TOLERANCE_UNDER for shortfalls
+    below prediction, VERIFY_TOLERANCE_OVER for surpluses above — see those
+    constants for why): early-accept ("verified-seq") when the first
+    VERIFY_EARLY_MIN_N+ samples are all comfortably inside tolerance,
+    early-reject (falls back to full measurement) when the running mean is
+    clearly outside, full-window decision at VERIFY_WINDOW_N ("verified")
+    otherwise. A rejected prediction ends as "converged"/"converged-early"/
+    "max_samples" via the stability path.
 
     Returns:
         {
-          "steady": list[result_dict],   # samples past TRANSIENT_DISCARD_N
-          "mode": "converged" | "max_samples" | "verified",
+          "steady": list[result_dict],   # samples past the transient
+          "mode": "converged" | "converged-early" | "converged-tight"
+                  | "max_samples" | "verified" | "verified-seq" | "errors",
+          "transient_n": int,            # first steady fired_idx (adaptive
+                                         # at c=1, fixed discard at c>=2)
           "saturated": bool,             # achieved rate < target → cap throttling
           "achieved_rate_hz": float,     # actual arrivals/s in steady window
           "target_rate_hz": float|None,
@@ -1761,6 +1878,16 @@ def _run_level(*, endpoint: str, prompt: str, gen_size: int,
     # Audit ROBUSTNESS #5: bail out on persistent errors instead of
     # silently burning the whole MAX_SAMPLES_PER_LEVEL budget on failures.
     consecutive_errors = 0
+    # Adaptive c=1 transient state (see C1_TRANSIENT_* constants). c>=2
+    # levels keep the fixed TRANSIENT_DISCARD_N unconditionally.
+    c1_prev_decode: float | None = None
+    c1_steady_from: int | None = None
+    # Early-convergence / sequential-verify bookkeeping: decision checks
+    # run only when a new steady sample has arrived, so "consecutive"
+    # counts samples, not loop ticks.
+    early_ci_passes = 0
+    tight_band_passes = 0
+    last_eval_n = 0
 
     with ThreadPoolExecutor(max_workers=pool_size) as pool:
         while True:
@@ -1824,7 +1951,26 @@ def _run_level(*, endpoint: str, prompt: str, gen_size: int,
                         exit_mode = "errors"
                     continue
                 consecutive_errors = 0  # any successful result resets the run
-                is_steady = idx >= TRANSIENT_DISCARD_N
+                if target_rate_hz is None:
+                    # c=1: completions are serial and in fired order, so
+                    # the transient can be detected adaptively — steady
+                    # starts at the first sample that agrees with its
+                    # predecessor. Detection stops mattering once the
+                    # fixed discard is reached (fallback = old behavior).
+                    d = result.get("decode_tps")
+                    if (c1_steady_from is None and idx < TRANSIENT_DISCARD_N
+                            and d):
+                        if (c1_prev_decode
+                                and idx >= C1_TRANSIENT_MIN_DISCARD
+                                and abs(d - c1_prev_decode) / c1_prev_decode
+                                <= C1_TRANSIENT_AGREE_TOL):
+                            c1_steady_from = idx
+                        c1_prev_decode = d
+                    is_steady = idx >= (c1_steady_from
+                                        if c1_steady_from is not None
+                                        else TRANSIENT_DISCARD_N)
+                else:
+                    is_steady = idx >= TRANSIENT_DISCARD_N
                 row = _write_row(
                     raw_f, raw_lock, result,
                     preset=preset, context_size=context_size, gen_size=gen_size,
@@ -1855,27 +2001,46 @@ def _run_level(*, endpoint: str, prompt: str, gen_size: int,
                 samples_mode=mode_hint,
             )
 
-            # Verify-mode early exit: if we have a prediction and the
-            # first VERIFY_WINDOW_N steady samples match it within
-            # tolerance, exit immediately. Otherwise fall through to the
-            # normal CI-based stability check.
-            if (not stopping and verify_prediction is not None
-                    and len(samples_for_stability) >= VERIFY_WINDOW_N):
+            # Decision checks below run only when a new steady sample has
+            # arrived — consecutive-pass counters must count samples, not
+            # loop ticks.
+            n_steady_now = len(samples_for_stability)
+            n_changed = n_steady_now > last_eval_n
+            if n_changed:
+                last_eval_n = n_steady_now
+
+            # Verify-mode sequential decision: early-accept when every
+            # sample so far is comfortably inside tolerance, early-reject
+            # when the running mean is clearly outside, full-window
+            # decision at VERIFY_WINDOW_N otherwise. Asymmetric tolerance
+            # per direction — see VERIFY_TOLERANCE_* comment: surpluses
+            # over prediction are expected good news (c_sat>1 boost, wide
+            # tolerance), shortfalls are unexpected degradation (tight
+            # tolerance, investigate with full measurement).
+            if (not stopping and n_changed and verify_prediction is not None
+                    and verify_prediction > 0):
                 window = samples_for_stability[:VERIFY_WINDOW_N]
-                mean = sum(window) / len(window)
-                if verify_prediction > 0:
-                    # Asymmetric tolerance — see VERIFY_TOLERANCE_* comment.
-                    # Over-prediction (mean > pred) means the system is
-                    # outperforming the model (c_sat>1 boost); wide tolerance.
-                    # Under-prediction means unexpected degradation; tight
-                    # tolerance triggers full measurement to investigate.
-                    if mean >= verify_prediction:
-                        deviation = (mean - verify_prediction) / verify_prediction
-                        tolerance = VERIFY_TOLERANCE_OVER
-                    else:
-                        deviation = (verify_prediction - mean) / verify_prediction
-                        tolerance = VERIFY_TOLERANCE_UNDER
-                    if deviation <= tolerance:
+                pred = verify_prediction
+
+                def _dev_tol(value: float) -> tuple[float, float]:
+                    # (deviation fraction, that direction's tolerance)
+                    if value >= pred:
+                        return (value - pred) / pred, VERIFY_TOLERANCE_OVER
+                    return (pred - value) / pred, VERIFY_TOLERANCE_UNDER
+
+                mean_dev, mean_tol = _dev_tol(sum(window) / len(window))
+                if (len(window) >= VERIFY_EARLY_REJECT_MIN_N
+                        and mean_dev > mean_tol * VERIFY_EARLY_REJECT_FRAC):
+                    # Clearly outside tolerance — don't burn the rest of
+                    # the window confirming it; full measurement now.
+                    verify_prediction = None
+                elif (len(window) >= VERIFY_EARLY_MIN_N
+                        and all(dev <= tol * VERIFY_EARLY_ACCEPT_FRAC
+                                for dev, tol in map(_dev_tol, window))):
+                    stopping = True
+                    exit_mode = "verified-seq"
+                elif len(window) >= VERIFY_WINDOW_N:
+                    if mean_dev <= mean_tol:
                         stopping = True
                         exit_mode = "verified"
                     else:
@@ -1884,12 +2049,53 @@ def _run_level(*, endpoint: str, prompt: str, gen_size: int,
                         # this and future iterations.
                         verify_prediction = None
 
-            # Stability check — once we have enough steady-state samples.
-            if not stopping and len(samples_for_stability) >= STABILITY_WINDOW_N:
-                window = samples_for_stability[-STABILITY_WINDOW_N:]
-                if _ci_relative_halfwidth(window) < STABILITY_CI_REL_THRESHOLD:
-                    stopping = True  # stop firing; still drain in-flight
-                    exit_mode = "converged"
+            # Stability check — standard path: z-CI over the last
+            # STABILITY_WINDOW_N steady samples vs the 10% bar (unchanged,
+            # cross-comparable with prior runs). Before the window fills,
+            # two early tiers run on ALL steady samples, both gated on
+            # consecutive passes:
+            #   tight band  — relative range under TIGHT_BAND_REL_RANGE;
+            #                 distribution-free, drift widens the range
+            #                 and blocks it ("converged-tight")
+            #   early t-CI  — Student-t CI under the stricter 5% bar
+            #                 ("converged-early")
+            # See the TIGHT_BAND_* / EARLY_STABILITY_* comments.
+            if not stopping and n_changed:
+                if n_steady_now >= STABILITY_WINDOW_N:
+                    window = samples_for_stability[-STABILITY_WINDOW_N:]
+                    if _ci_relative_halfwidth(window) < STABILITY_CI_REL_THRESHOLD:
+                        stopping = True  # stop firing; still drain in-flight
+                        exit_mode = "converged"
+                elif verify_prediction is None:
+                    # Early tiers are suppressed while a verify prediction
+                    # is active: the verify decision must not be preempted
+                    # by a generic convergence exit, because downstream
+                    # logic (cross-cell shape transfer) reads any
+                    # non-verified mode on a predicted level as a
+                    # rejection. Verify always decides by VERIFY_WINDOW_N
+                    # samples or clears the prediction, at which point
+                    # these tiers take over.
+                    if n_steady_now >= TIGHT_BAND_MIN_N:
+                        m = sum(samples_for_stability) / n_steady_now
+                        rel_range = ((max(samples_for_stability)
+                                      - min(samples_for_stability)) / m
+                                     if m > 0 else float("inf"))
+                        if rel_range < TIGHT_BAND_REL_RANGE:
+                            tight_band_passes += 1
+                            if tight_band_passes >= TIGHT_BAND_CONSECUTIVE:
+                                stopping = True
+                                exit_mode = "converged-tight"
+                        else:
+                            tight_band_passes = 0
+                    if not stopping and n_steady_now >= EARLY_STABILITY_MIN_N:
+                        if (_ci_relative_halfwidth_t(samples_for_stability)
+                                < EARLY_STABILITY_CI_REL_THRESHOLD):
+                            early_ci_passes += 1
+                            if early_ci_passes >= EARLY_STABILITY_CONSECUTIVE:
+                                stopping = True  # stop firing; drain in-flight
+                                exit_mode = "converged-early"
+                        else:
+                            early_ci_passes = 0
 
             # Hard cap on fired arrivals (failsafe).
             if fired >= MAX_SAMPLES_PER_LEVEL:
@@ -1918,22 +2124,86 @@ def _run_level(*, endpoint: str, prompt: str, gen_size: int,
             achieved_rate_hz = (len(steady_fires) - 1) / span_s
         saturated = achieved_rate_hz < target_rate_hz * SATURATION_RATE_FRACTION
 
+    # Effective transient boundary: adaptive at c=1 (when agreement was
+    # found before the fixed discard), fixed TRANSIENT_DISCARD_N otherwise.
+    # Must match the is_steady rule used at harvest time above.
+    steady_min_idx = (c1_steady_from
+                      if (target_rate_hz is None and c1_steady_from is not None)
+                      else TRANSIENT_DISCARD_N)
+
+    # Within-level drift check (see DRIFT_WARN_* comment). Computed on the
+    # steady decode samples in completion order; reported to the caller
+    # for a fail-loud warning, never acted on here.
+    drift = None
+    if len(samples_for_stability) >= DRIFT_WARN_MIN_N:
+        half = len(samples_for_stability) // 2
+        m1 = sum(samples_for_stability[:half]) / half
+        m2 = (sum(samples_for_stability[half:])
+              / (len(samples_for_stability) - half))
+        if m1 > 0:
+            rel = (m2 - m1) / m1
+            deltas = [b - a for a, b in zip(samples_for_stability,
+                                            samples_for_stability[1:])]
+            same_dir = sum(1 for d in deltas
+                           if (d > 0) == (rel > 0) and d != 0)
+            sign_frac = same_dir / len(deltas) if deltas else 0.0
+            if abs(rel) > DRIFT_WARN_REL and sign_frac >= DRIFT_WARN_SIGN_FRAC:
+                drift = {"rel": rel, "sign_frac": sign_frac,
+                         "n": len(samples_for_stability)}
+
     return {
-        "steady": [r for idx, r in samples_completed if idx >= TRANSIENT_DISCARD_N],
+        "steady": [r for idx, r in samples_completed if idx >= steady_min_idx],
         "mode": exit_mode,
+        "transient_n": steady_min_idx,
+        "drift": drift,
         "saturated": saturated,
         "achieved_rate_hz": achieved_rate_hz,
         "target_rate_hz": target_rate_hz,
     }
 
 
+def _warn_drift(dashboard, lvl: dict, c: int) -> None:
+    """Fail-loud surfacing of a within-level decode drift (see DRIFT_WARN_*
+    constants). A monotonic slide means the rig is broken — insufficient
+    cooling or a power problem — not that the model is slow."""
+    d = lvl.get("drift")
+    if not d:
+        return
+    dashboard.log_event(
+        f"decode t/s drifted {d['rel']*100:+.1f}% within c={c} level "
+        f"({d['sign_frac']*100:.0f}% of steps in the same direction, "
+        f"n={d['n']}) — check cooling/power (thermal throttle or power "
+        f"cap); numbers from this level are suspect",
+        level="error", type="level_drift",
+        c=c, drift_rel=d["rel"], drift_sign_frac=d["sign_frac"], n=d["n"],
+    )
+
+
 def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
                   preset: str, context_size: int, max_concurrency: int,
                   raw_f, raw_lock, dashboard, console: Console,
-                  predict_shortcut: bool = True) -> dict:
+                  predict_shortcut: bool = True,
+                  xcell_shape: dict | None = None) -> dict:
     """Drive one (preset, ctx, gen) cell through a +1 ramp. The ramp climbs
     through every level up to max_concurrency, labeling knees as it goes
     (informational, not stop signals).
+
+    `xcell_shape` ({"ratios": {c: per_req(c)/c1}, "fit": <hyperbolic fit>,
+    "c1": <that cell's baseline>}) is a previous cell's per_req(c) shape
+    from THIS run. When set, levels that don't yet have an in-cell fit run
+    in verify mode against the transferred shape rescaled by this cell's
+    own measured c=1 baseline. Levels the previous cell actually MEASURED
+    transfer as measured ratios (source "xcell-meas" — no model bias);
+    the fitted curve is used only to extrapolate past the previous cell's
+    last measured level (source "xcell-fit"). Observed 2026-06-09 on
+    GB10: the hyperbolic fit systematically underpredicts c=2 when
+    degradation is superlinear (the collapsed high-c points steepen the
+    1/per_req line), so fitted values must not stand in for ground truth
+    we already hold. Either way the transfer hypothesis is tested with
+    real samples at every level, never assumed. A rejection falls back to
+    full measurement of that level and is reported via "xcell_broken" in
+    the return dict so the caller can stop offering the shape to later
+    cells.
 
     Arrival rate at level c is FIXED: target_rate = c / T_req(c=1). In-flight
     is hard-capped at c, so the label "c=N" honestly means "at most N
@@ -2020,11 +2290,14 @@ def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
     c1_aggregate_tps = c1_decode_tps  # by definition at c=1
     dashboard.log_event(
         f"c=1 baseline ({lvl['mode']}): {c1_decode_tps:.1f} t/s per req, "
-        f"T_req={c1_wall_s:.2f}s ({len(c1_steady)} steady samples)",
+        f"T_req={c1_wall_s:.2f}s ({len(c1_steady)} steady samples, "
+        f"transient {lvl.get('transient_n')})",
         level="info", type="baseline_complete",
         c=1, per_req_decode_tps=c1_decode_tps, t_req_s=c1_wall_s,
         n_steady=len(c1_steady), mode=lvl["mode"],
+        transient_n=lvl.get("transient_n"),
     )
+    _warn_drift(dashboard, lvl, c=1)
 
     levels: list[dict] = [{
         "c": 1, "mode": lvl["mode"],
@@ -2037,6 +2310,7 @@ def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
     knee_aggregate_c: int | None = None
     saturated_from_c: int | None = None
     stop_reason = "max_concurrency"
+    xcell_broken = False
 
     # Aggregate-decline + plateau termination state (see AGGREGATE_* comments).
     peak_aggregate = c1_aggregate_tps
@@ -2054,11 +2328,31 @@ def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
         # Prediction shortcut: once MIN_FULL_LEVELS levels are measured
         # fully, fit per_req(c) and run subsequent levels in verify mode.
         # Skip-out when measurement matches prediction within tolerance.
+        # Before the in-cell fit exists, a cross-cell shape from earlier
+        # in this run (if offered and not yet rejected) fills the same
+        # role: its prediction is the previous cell's curve normalized by
+        # that cell's c=1 and rescaled by THIS cell's measured c=1.
         verify_pred = None
+        verify_source = None
         if predict_shortcut and len(levels) >= MIN_FULL_LEVELS:
             fit = _fit_per_req_model(levels)
             if fit is not None:
                 verify_pred = _predict_per_req(c, fit)
+                verify_source = "cell"
+        if (verify_pred is None and predict_shortcut
+                and not xcell_broken and xcell_shape is not None):
+            # Measured ratio first — ground truth from the previous cell,
+            # no model bias. Fit only extrapolates past what was measured.
+            ratio = (xcell_shape.get("ratios") or {}).get(c)
+            if ratio:
+                verify_pred = ratio * c1_decode_tps
+                verify_source = "xcell-meas"
+            else:
+                prev_pred = _predict_per_req(c, xcell_shape.get("fit"))
+                prev_c1 = xcell_shape.get("c1")
+                if prev_pred and prev_c1:
+                    verify_pred = prev_pred / prev_c1 * c1_decode_tps
+                    verify_source = "xcell-fit"
 
         dashboard.update(current={
             "preset": preset, "context_size": context_size, "gen_size": gen_size,
@@ -2066,11 +2360,12 @@ def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
         })
         if verify_pred is not None:
             dashboard.log_event(
-                f"→ c={c} @ {target_rate_hz:.2f} Hz (verify mode, "
+                f"→ c={c} @ {target_rate_hz:.2f} Hz (verify mode [{verify_source}], "
                 f"predicted {verify_pred:.1f} t/s)…",
                 level="info", type="level_start",
                 c=c, target_rate_hz=target_rate_hz,
                 verify_prediction=verify_pred,
+                verify_source=verify_source,
             )
         else:
             dashboard.log_event(
@@ -2087,6 +2382,21 @@ def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
             dashboard=dashboard, console=console,
             verify_prediction=verify_pred,
         )
+        # Cross-cell transfer is falsified the moment a level it predicted
+        # fails to verify (any non-verified exit). The level itself was
+        # fully measured by the fallback, so no data is lost — but stop
+        # offering the shape: this rig is telling us the ramp shape does
+        # not generalize across cells.
+        if (verify_source is not None and verify_source.startswith("xcell")
+                and lvl["mode"] not in ("verified", "verified-seq")):
+            xcell_broken = True
+            dashboard.log_event(
+                f"c={c}: cross-cell prediction rejected "
+                f"(source={verify_source}, mode={lvl['mode']}) "
+                f"— shape transfer disabled for the rest of the run",
+                level="warn", type="xcell_reject", c=c, mode=lvl["mode"],
+                verify_source=verify_source,
+            )
         steady = lvl["steady"]
         if not steady:
             dashboard.log_event(
@@ -2156,6 +2466,7 @@ def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
             per_req_decode_tps=per_req, aggregate_decode_tps=aggregate,
             per_req_frac_of_c1=per_req_frac, agg_frac_of_prev=agg_frac,
         )
+        _warn_drift(dashboard, lvl, c=c)
 
         # Label per-req knee inline. Aggregate peak is computed after the
         # ramp ends using argmax over all levels — labeling on the first
@@ -2271,6 +2582,7 @@ def run_ramp_cell(*, endpoint: str, prompt: str, gen_size: int,
         "knee_aggregate_c": knee_aggregate_c,
         "saturated_from_c": saturated_from_c,
         "levels": levels,
+        "xcell_broken": xcell_broken,
     }
 
 
@@ -2475,6 +2787,12 @@ def main() -> int:
                         yield preset, cs, gs
 
         cell_summaries: list[dict] = []
+        # Cross-cell shape transfer state. "shape" carries the most recent
+        # cell's fitted per_req(c) curve + its c=1 baseline into the next
+        # cell, where it seeds verify-mode predictions (tested per level,
+        # never assumed — see run_ramp_cell). One rejection anywhere
+        # disables transfer for the remainder of the run.
+        xcell = {"shape": None, "enabled": predict_shortcut}
 
         def run_one_cell(preset: str, cs: int, gs: int) -> None:
             summary = run_ramp_cell(
@@ -2485,8 +2803,25 @@ def main() -> int:
                 raw_f=raw_f, raw_lock=raw_lock,
                 dashboard=dashboard, console=console,
                 predict_shortcut=predict_shortcut,
+                xcell_shape=xcell["shape"] if xcell["enabled"] else None,
             )
             cell_summaries.append(summary)
+            if summary.get("xcell_broken"):
+                xcell["enabled"] = False
+                xcell["shape"] = None
+            elif xcell["enabled"] and summary.get("c1_decode_tps"):
+                # Measured per-level ratios are the shape's ground truth;
+                # the hyperbolic fit rides along only for extrapolating
+                # past this cell's last measured level.
+                c1 = summary["c1_decode_tps"]
+                ratios = {lvl["c"]: lvl["per_req_decode_tps"] / c1
+                          for lvl in summary.get("levels") or []
+                          if lvl.get("c", 0) >= 2
+                          and lvl.get("per_req_decode_tps")}
+                fit = _fit_per_req_model(summary.get("levels") or [])
+                if ratios or fit is not None:
+                    xcell["shape"] = {"ratios": ratios, "fit": fit,
+                                      "c1": c1}
 
         if live_mode:
             with Live(dashboard.layout, console=console, refresh_per_second=8,
